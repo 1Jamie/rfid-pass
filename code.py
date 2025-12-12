@@ -45,7 +45,12 @@ KNOWN_KEYS = [
 # --- Security Config ---
 # CHANGE THIS to a unique secret for your device!
 MASTER_SECRET = b"SuperSecretKey123" 
-MAGIC_HEADER = b"PfId" # Password-RFID ID
+MAGIC_HEADER_PASS = b"PfId" # Password-RFID ID (Legacy/Default)
+MAGIC_HEADER_USER = b"PfUs" # Password-RFID User+Pass
+
+TYPE_UNKNOWN = 0
+TYPE_PASS = 1
+TYPE_USER = 2
 
 def derive_key(uid):
     """
@@ -127,16 +132,16 @@ def auth_sector(uid):
             reader.stop_crypto1()  
     return False
 
-def write_card_password(uid, password):
+def write_card_data(uid, text_data, header=MAGIC_HEADER_PASS):
     print("Writing to card...")
     
     # 1. Prepare Plaintext
-    b_pass = password.encode('utf-8')
-    if len(b_pass) > 44:
-        b_pass = b_pass[:44] # Truncate
+    b_data = text_data.encode('utf-8')
+    if len(b_data) > 44:
+        b_data = b_data[:44] # Truncate
         
     # Pad with 0
-    payload = list(MAGIC_HEADER) + list(b_pass) + [0] * (44 - len(b_pass))
+    payload = list(header) + list(b_data) + [0] * (44 - len(b_data))
     
     # 2. Encrypt
     key_stream = derive_key(uid)
@@ -169,7 +174,7 @@ def write_card_password(uid, password):
         print("Write Success (Mifare Secure)!")
         return True
 
-def read_card_password(uid):
+def read_card_data(uid):
     raw_data = []
     
     if is_ntag(uid):
@@ -177,19 +182,19 @@ def read_card_password(uid):
         raw_data = read_ntag_chunks(NTAG_START_PAGE, NTAG_PAGES)
         if raw_data is None:
             # print("DEBUG: NTAG Read Failed")
-            return None
+            return (TYPE_UNKNOWN, None)
     else:
         # Mifare Read
         if not auth_sector(uid):
             # print("DEBUG: Auth Failed in read_card_password") 
-            return None
+            return (TYPE_UNKNOWN, None)
             
         for block_addr in SECTOR_BLOCKS:
             block_data = reader.read(block_addr)
             if block_data is None:
                 reader.stop_crypto1()
                 # print(f"DEBUG: Read returned None for block {block_addr}")
-                return None
+                return (TYPE_UNKNOWN, None)
             raw_data.extend(block_data)
             
         reader.stop_crypto1()
@@ -199,11 +204,20 @@ def read_card_password(uid):
     decrypted_data = xor_crypt(raw_data, key_stream)
     
     # Check Magic Header
-    if decrypted_data[:4] != MAGIC_HEADER:
-        return None
+    card_type = TYPE_UNKNOWN
+    payload_start = 0
+    
+    if decrypted_data[:4] == MAGIC_HEADER_PASS:
+        card_type = TYPE_PASS
+        payload_start = 4
+    elif decrypted_data[:4] == MAGIC_HEADER_USER:
+        card_type = TYPE_USER
+        payload_start = 4
+    else:
+        return (TYPE_UNKNOWN, None)
         
     # Strip Header
-    payload = decrypted_data[4:]
+    payload = decrypted_data[payload_start:]
     
     # Decode
     try:
@@ -214,10 +228,10 @@ def read_card_password(uid):
             final_chars.append(chr(b))
             
         final_str = "".join(final_chars)
-        return final_str
+        return (card_type, final_str)
     except Exception as e:
         print(f"Decryption Error: {repr(e)}")
-        return None
+        return (TYPE_UNKNOWN, None)
 
 def wipe_card(uid):
     zeros = [0] * 48
@@ -247,13 +261,14 @@ STATE_WRITE_WAIT = 1
 STATE_WIPE_WAIT = 2
 
 current_state = STATE_IDLE
-pending_password = ""
+pending_data = ""
+pending_header = MAGIC_HEADER_PASS
 
 print("Ready (Secure On-Card Storage Mode).")
-print("Type 'write <pass>' to burn a password.")
+print("Type 'write <pass>' or 'write <user> <pass>' to burn credentials.")
 
 def process_command(cmd):
-    global current_state, pending_password
+    global current_state, pending_data, pending_header
     parts = cmd.split()
     if not parts: return
     
@@ -261,11 +276,19 @@ def process_command(cmd):
     
     if op == "write":
         if len(parts) < 2:
-            print("Usage: write <password>")
+            print("Usage: write <password> OR write <username> <password>")
         else:
-            pending_password = " ".join(parts[1:])
+            if len(parts) == 2:
+                # Password only
+                pending_data = parts[1]
+                pending_header = MAGIC_HEADER_PASS
+            else:
+                # Username + Password
+                pending_data = parts[1] + "\n" + " ".join(parts[2:])
+                pending_header = MAGIC_HEADER_USER
+                
             current_state = STATE_WRITE_WAIT
-            print(f"Scan card to BURN password")
+            print(f"Scan card to BURN credentials")
             print("WARNING: existing cards must be wiped or overwritten.")
             
     elif op == "wipe":
@@ -273,7 +296,7 @@ def process_command(cmd):
         print("Scan card to WIPE Sector 1...")
         
     elif op == "help":
-        print("Commands: write <pass>, wipe")
+        print("Commands: write <pass>, write <user> <pass>, wipe")
         
     else:
         print("Unknown command.")
@@ -311,7 +334,7 @@ while True:
                 
                 if current_state == STATE_WRITE_WAIT:
                     # WRITE Mode
-                    write_card_password(uid, pending_password)
+                    write_card_data(uid, pending_data, pending_header)
                     current_state = STATE_IDLE
                     time.sleep(1.0)
                     
@@ -324,11 +347,27 @@ while True:
                 else:
                     # READ / AUTH Mode
                     # print("Reading card...")
-                    passwd = read_card_password(uid)
-                    if passwd:
-                        print(f"Card {h_id}: Password found!")
-                        layout.write(passwd)
+                    (c_type, c_data) = read_card_data(uid)
+                    
+                    if c_type == TYPE_PASS and c_data:
+                        print(f"Card {h_id}: Password found (Legacy)!")
+                        layout.write(c_data)
                         kbd.send(Keycode.ENTER)
+                        time.sleep(2.0)
+                        
+                    elif c_type == TYPE_USER and c_data:
+                        print(f"Card {h_id}: User+Pass found!")
+                        # Split by newline
+                        if "\n" in c_data:
+                            uname, pword = c_data.split("\n", 1)
+                            layout.write(uname)
+                            kbd.send(Keycode.TAB)
+                            layout.write(pword)
+                            kbd.send(Keycode.ENTER)
+                        else:
+                            # Fallback if corrupt
+                            print("Error: Malformed User Data")
+                            
                         time.sleep(2.0)
                     else:
                         # print(f"Card {h_id}: No valid password found")
