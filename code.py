@@ -13,7 +13,17 @@ import json
 import wifi
 import socketpool
 import os
+import sys
+
+# Ensure lib directory is in path
+if "lib" not in sys.path:
+    sys.path.append("lib")
+
 from adafruit_httpserver import Server, Request, Response
+import rtc
+import adafruit_ntp
+import adafruit_hashlib as hashlib
+import struct
 
 # --- Setup ---
 sck = board.GP18
@@ -30,21 +40,29 @@ layout = KeyboardLayoutUS(kbd)
 # --- Wi-Fi & WebUI Setup ---
 # Read WebUI enabled flag (default to False if not set)
 # Supports: 1/0 (integer), true/false (boolean), or "true"/"false" (string)
+# Supports: 1/0 (integer), true/false (boolean), or "true"/"false" (string)
 webui_enabled = False
-try:
-    webui_enabled_val = os.getenv("WEBUI_ENABLED")
-    if webui_enabled_val is not None:
-        if isinstance(webui_enabled_val, bool):
-            webui_enabled = webui_enabled_val
-        elif isinstance(webui_enabled_val, (int, float)):
-            # Handle numeric values (0 = false, non-zero = true)
-            webui_enabled = bool(webui_enabled_val)
-        else:
-            # Convert to string and check (handles string values like "true", "1", etc.)
-            webui_enabled = str(webui_enabled_val).lower().strip() in ("true", "1", "yes", "on")
-except Exception:
-    # Silently default to disabled if there's any error reading the value
-    webui_enabled = False
+wifi_enabled = False
+
+def parse_bool_env(key, default=False):
+    try:
+        val = os.getenv(key)
+        if val is not None:
+            if isinstance(val, bool):
+                return val
+            elif isinstance(val, (int, float)):
+                return bool(val)
+            else:
+                return str(val).lower().strip() in ("true", "1", "yes", "on")
+    except Exception:
+        pass
+    return default
+
+webui_enabled = parse_bool_env("WEBUI_ENABLED", False)
+wifi_enabled = parse_bool_env("WIFI_ENABLED", False)
+# If WebUI is enabled, WiFi must be enabled essentially (but we treat them as separate flags for startup intent)
+# We won't force wifi_enabled=True here, but we will ensure WiFi connects if WebUI is requested.
+
 
 ssid = os.getenv("SSID")
 password = os.getenv("PASS")
@@ -54,31 +72,18 @@ pool = None
 server = None
 wifi_connected = False
 
-def init_webui():
-    """Initialize WiFi connection and web server"""
-    global pool, server, wifi_connected, ssid, password
+def connect_wifi():
+    """Connect to WiFi if not already connected"""
+    global wifi_connected, ssid, password
     
     if not ssid or not password:
-        print("WebUI: SSID or PASS not configured in settings.toml")
+        print("WiFi: SSID or PASS not configured in settings.toml")
         return False
-    
+        
     if wifi_connected and wifi.radio.ipv4_address:
-        print("WebUI: WiFi already connected")
-        if server is None:
-            # WiFi connected but server not started
-            try:
-                pool = socketpool.SocketPool(wifi.radio)
-                server = Server(pool, "/static", debug=True)
-                setup_web_routes()
-                server.start(str(wifi.radio.ipv4_address))
-                print(f"WebUI: Server started at http://{wifi.radio.ipv4_address}/")
-                return True
-            except Exception as e:
-                print(f"WebUI: Failed to start server: {e}")
-                return False
         return True
-    
-    print(f"WebUI: Connecting to {ssid}...")
+        
+    print(f"WiFi: Connecting to {ssid}...")
     try:
         wifi.radio.connect(ssid, password)
         # Wait for connection
@@ -89,25 +94,54 @@ def init_webui():
             retry_count += 1
         
         if wifi.radio.ipv4_address:
-            print(f"WebUI: Connected! IP: {wifi.radio.ipv4_address}")
+            print(f"WiFi: Connected! IP: {wifi.radio.ipv4_address}")
             wifi_connected = True
-            
-            pool = socketpool.SocketPool(wifi.radio)
-            server = Server(pool, "/static", debug=True)
-            setup_web_routes()
-            server.start(str(wifi.radio.ipv4_address))
-            print(f"WebUI: Server started at http://{wifi.radio.ipv4_address}/")
             return True
         else:
-            print("WebUI: Connection timeout")
+            print("WiFi: Connection timeout")
             return False
     except Exception as e:
-        print(f"WebUI: Connection failed: {e}")
+        print(f"WiFi: Connection failed: {e}")
         return False
 
-def shutdown_webui():
-    """Shutdown web server and disconnect WiFi"""
+def disconnect_wifi():
+    """Disconnect WiFi"""
+    global wifi_connected
+    if wifi_connected:
+        try:
+            wifi.radio.stop_station()
+            print("WiFi: Disconnected")
+        except Exception as e:
+            print(f"WiFi: Error disconnecting: {e}")
+        wifi_connected = False
+
+def start_web_server():
+    """Start the WebUI server (requires WiFi)"""
     global pool, server, wifi_connected
+    
+    if server is not None:
+        print("WebUI: Server already running")
+        return True
+        
+    if not wifi_connected or not wifi.radio.ipv4_address:
+        print("WebUI: Cannot start - WiFi not connected")
+        if not connect_wifi():
+            return False
+            
+    try:
+        pool = socketpool.SocketPool(wifi.radio)
+        server = Server(pool, "/static", debug=True)
+        setup_web_routes()
+        server.start(str(wifi.radio.ipv4_address))
+        print(f"WebUI: Server started at http://{wifi.radio.ipv4_address}/")
+        return True
+    except Exception as e:
+        print(f"WebUI: Failed to start server: {e}")
+        return False
+
+def stop_web_server():
+    """Stop the WebUI server"""
+    global pool, server
     
     if server is not None:
         try:
@@ -119,14 +153,6 @@ def shutdown_webui():
     
     if pool is not None:
         pool = None
-    
-    if wifi_connected:
-        try:
-            wifi.radio.stop_station()
-            print("WebUI: WiFi disconnected")
-        except Exception as e:
-            print(f"WebUI: Error disconnecting WiFi: {e}")
-        wifi_connected = False
 
 def url_decode(encoded):
     """
@@ -198,12 +224,15 @@ def setup_web_routes():
         elif card_type == "macro":
             pending_data = macro_text
             pending_header = MAGIC_HEADER_MACRO
+        elif card_type == "totp":
+            pending_data = data.get("totp_secret", "").replace(" ", "").upper()
+            pending_header = MAGIC_HEADER_TOTP
         else:
             pending_data = password
             pending_header = MAGIC_HEADER_PASS
             
         current_state = STATE_WRITE_WAIT
-        type_name = {"pass": "password", "user": "username+password", "macro": "macro"}.get(card_type, "data")
+        type_name = {"pass": "password", "user": "username+password", "macro": "macro", "totp": "totp"}.get(card_type, "data")
         last_web_status = f"Waiting for card to write ({type_name})..."
         print(f"WebUI: Ready to write ({card_type})")
         
@@ -235,11 +264,7 @@ def setup_web_routes():
         }
         return Response(request, json.dumps(status_data), content_type="application/json")
 
-# Initialize WebUI if enabled
-if webui_enabled:
-    init_webui()
-else:
-    print("WebUI: Disabled in settings.toml (WEBUI_ENABLED=false)")
+
 
 
 # --- RFID Config ---
@@ -268,6 +293,7 @@ MASTER_SECRET = b"SuperSecretKey123"
 MAGIC_HEADER_PASS = b"PfId" # Password-RFID ID (Legacy/Default)
 MAGIC_HEADER_USER = b"PfUs" # Password-RFID User+Pass
 MAGIC_HEADER_MACRO = b"PfMc" # Password-RFID Macro
+MAGIC_HEADER_TOTP = b"Pf2F" # Password-RFID TOTP
 
 # Continuation flags for chained blocks/pages
 CONTINUE_FLAG = 0xFF  # Continue to next block/page
@@ -281,6 +307,8 @@ TYPE_UNKNOWN = 0
 TYPE_PASS = 1
 TYPE_USER = 2
 TYPE_MACRO = 3
+TYPE_TOTP = 4
+TYPE_TOTP = 4
 
 # Keycode name mapping for macro parser
 KEYCODE_MAP = {
@@ -346,6 +374,126 @@ def xor_crypt(data, key_stream):
     for i in range(len(data)):
         out[i] = data[i] ^ key_stream[i % len(key_stream)]
     return out
+
+# --- TOTP & Time Logic ---
+def sync_time():
+    """Syncs usage RTC via NTP if Wi-Fi is connected."""
+    global wifi_connected
+    if not wifi_connected or not pool:
+        print("TOTP: Cannot sync time (No Wi-Fi)")
+        return False
+        
+    print("TOTP: Syncing time via NTP...")
+    try:
+        ntp = adafruit_ntp.NTP(pool, tz_offset=0)
+        rtc.RTC().datetime = ntp.datetime
+        print(f"TOTP: Time synced! Current UTC: {time.time()}")
+        return True
+    except Exception as e:
+        print(f"TOTP: Time sync failed: {e}")
+        return False
+
+def base32_decode(encoded):
+    """Simple Base32 decoder (RFC 4648)"""
+    # Standard Base32 alphabet
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    padding = "="
+    
+    encoded = encoded.upper().rstrip(padding)
+    res_bits = 0
+    res_buffer = 0
+    output = bytearray()
+    
+    for char in encoded:
+        if char not in alphabet:
+            continue
+        val = alphabet.index(char)
+        res_buffer = (res_buffer << 5) | val
+        res_bits += 5
+        while res_bits >= 8:
+            res_bits -= 8
+            output.append((res_buffer >> res_bits) & 0xFF)
+            
+    return output
+
+def hmac_sha1(key, msg):
+    """
+    Standard HMAC-SHA1 implementation using adafruit_hashlib
+    """
+    block_size = 64
+    
+    if len(key) > block_size:
+        # If key is longer than block_size, hash it first
+        h = hashlib.sha1()
+        h.update(key)
+        key = h.digest()
+        
+    if len(key) < block_size:
+        # Pad key with zeros
+        key = key + b'\x00' * (block_size - len(key))
+        
+    # Inner and Outer pads
+    o_key_pad = bytearray(x ^ 0x5c for x in key)
+    i_key_pad = bytearray(x ^ 0x36 for x in key)
+    
+    # Inner hash
+    h_inner = hashlib.sha1()
+    h_inner.update(i_key_pad)
+    h_inner.update(msg)
+    inner_digest = h_inner.digest()
+    
+    # Outer hash
+    h_outer = hashlib.sha1()
+    h_outer.update(o_key_pad)
+    h_outer.update(inner_digest)
+    return h_outer.digest()
+
+def generate_totp(secret_base32):
+    """
+    Generates the current 6-digit TOTP code.
+    """
+    try:
+        # Decode secret
+        secret_bytes = base32_decode(secret_base32)
+        
+        # Use time_ns() to avoid 32-bit float precision loss
+        try:
+             now_ns = time.time_ns()
+             now = now_ns // 1000000000
+        except AttributeError:
+             now = int(time.time())
+
+        # DEBUG: Print time to see if it's advancing
+        print(f"DEBUG: TOTP UnixTime={now}")
+        
+        # Calculate counter
+        counter = now // 30
+        print(f"DEBUG: TOTP Counter={counter}")
+        
+        # Pack counter into 8 bytes (big endian)
+        msg = struct.pack(">Q", counter)
+        
+        # HMAC-SHA1
+        digest = hmac_sha1(secret_bytes, msg)
+        
+        # Truncate
+        offset = digest[-1] & 0x0F
+        code_int = ((digest[offset] & 0x7F) << 24 |
+                    (digest[offset + 1] & 0xFF) << 16 |
+                    (digest[offset + 2] & 0xFF) << 8 |
+                    (digest[offset + 3] & 0xFF))
+        
+        # Modulo
+        code_int_val = code_int % 1000000
+        # Manual zfill since .zfill isn't in all CircuitPython builds
+        code_str = str(code_int_val)
+        while len(code_str) < 6:
+            code_str = "0" + code_str
+        return code_str
+        
+    except Exception as e:
+        print(f"TOTP Generation Error: {e}")
+        return "000000"
 
 # --- Macro Parser and Executor ---
 def parse_macro(macro_text):
@@ -950,6 +1098,9 @@ def decrypt_and_parse(uid, raw_data):
         elif header == MAGIC_HEADER_MACRO:
             card_type = TYPE_MACRO
             payload_start = 4
+        elif header == MAGIC_HEADER_TOTP:
+            card_type = TYPE_TOTP
+            payload_start = 4
         else:
             # Invalid header
             return (TYPE_UNKNOWN, None)
@@ -958,8 +1109,8 @@ def decrypt_and_parse(uid, raw_data):
         payload = decrypted_data[payload_start:]
         
         # Decode
-        if card_type == TYPE_MACRO:
-            # Macro data - return all bytes until null (or end)
+        if card_type == TYPE_MACRO or card_type == TYPE_TOTP:
+            # Macro/TOTP data - return all bytes until null (or end)
             final_chars = []
             for b in payload:
                 if b == 0:
@@ -1143,6 +1294,28 @@ def wipe_card(uid):
         return True
 
 # --- State Machine ---
+# Initialize WebUI if enabled
+# --- State Machine ---
+
+# 1. Handle WiFi Startup
+if wifi_enabled or webui_enabled:
+    if connect_wifi():
+        sync_time()
+else:
+    print("WiFi: Disabled in settings.toml")
+
+# 2. Handle WebUI Startup (only if specifically enabled)
+if webui_enabled:
+    if wifi_connected:
+        start_web_server()
+    else:
+        print("WebUI: Could not start (WiFi failed)")
+else:
+    if wifi_enabled: 
+        print("WebUI: Disabled (WiFi is ON for Time Sync/2FA)")
+    else:
+        print("WebUI: Disabled")
+
 STATE_IDLE = 0
 STATE_WRITE_WAIT = 1
 STATE_WIPE_WAIT = 2
@@ -1207,7 +1380,18 @@ def process_command(cmd):
             pending_header = MAGIC_HEADER_MACRO
             current_state = STATE_WRITE_WAIT
             print(f"Scan card to BURN macro ({len(pending_data.encode('utf-8'))} bytes)")
+            print(f"Scan card to BURN macro ({len(pending_data.encode('utf-8'))} bytes)")
             print("WARNING: existing cards must be wiped or overwritten.")
+
+    elif op == "totp":
+        if len(parts) < 2:
+            print("Usage: totp <base32_secret>")
+            print("Writes a 2FA secret to the card.")
+        else:
+            pending_data = parts[1].replace(" ", "").upper()
+            pending_header = MAGIC_HEADER_TOTP
+            current_state = STATE_WRITE_WAIT
+            print(f"Scan card to BURN TOTP Secret")
             
     elif op == "wipe":
         current_state = STATE_WIPE_WAIT
@@ -1231,19 +1415,69 @@ def process_command(cmd):
                     print("WebUI is already enabled")
                 else:
                     webui_enabled = True
-                    if init_webui():
+                    # Ensure WiFi is up
+                    if not wifi_connected:
+                         if connect_wifi():
+                             sync_time()
+                    
+                    if start_web_server():
                         print("WebUI enabled successfully")
                     else:
-                        print("WebUI enable failed - check SSID and PASS in settings.toml")
+                        print("WebUI enable failed")
+                        
             elif action in ("off", "disable", "stop"):
                 if server is None:
                     print("WebUI is already disabled")
                 else:
-                    shutdown_webui()
+                    stop_web_server()
+                    # We do NOT disconnect WiFi here, as per user request (WebUI toggle only affects WebUI)
                     webui_enabled = False
-                    print("WebUI disabled and WiFi disconnected")
+                    print("WebUI disabled (WiFi remains active)")
             else:
                 print("Usage: webui <on|off>")
+
+    elif op == "wifi":
+        if len(parts) < 2:
+            status = "connected" if wifi_connected else "disconnected"
+            print(f"WiFi is currently {status}")
+            if wifi_connected:
+                print(f"IP: {wifi.radio.ipv4_address}")
+            print("Usage: wifi <on|off>")
+        else:
+            action = parts[1].lower()
+            if action in ("on", "enable", "start"):
+                if wifi_connected:
+                    print("WiFi is already connected")
+                else:
+                    wifi_enabled = True
+                    if connect_wifi():
+                        print("WiFi connected successfully")
+                        sync_time()
+                        # If WebUI was supposed to be on, start it now? 
+                        # User said "wifi should toggle both" -> implying if I turn WiFi on, maybe WebUI should come on if it was enabled?
+                        # "the wifi should toggle both"
+                        # Interpretation: 
+                        # wifi off -> wifi disconnects AND webui stops.
+                        # wifi on -> wifi connects... does webui start? 
+                        # "if wifi is started up it should check the webui flag" -> YES.
+                        if webui_enabled:
+                            start_web_server()
+                    else:
+                        print("WiFi connection failed")
+                        
+            elif action in ("off", "disable", "stop"):
+                if not wifi_connected:
+                    print("WiFi is already disconnected")
+                else:
+                    # wifi off -> disable both
+                    stop_web_server()
+                    disconnect_wifi()
+                    wifi_enabled = False
+                    # Note: we don't necessarily set webui_enabled = False permanently, 
+                    # but the server is stopped. If we run "wifi on" later, it checks webui_enabled flag.
+                    print("WiFi disconnected (WebUI stopped)")
+            else:
+                print("Usage: wifi <on|off>")
         
     elif op == "help":
         print("Commands:")
@@ -1252,7 +1486,10 @@ def process_command(cmd):
         print("  macro <macro_text>        - Write advanced macro (Rubber Ducky style)")
         print("  read                      - Read card contents (display only, no execution)")
         print("  wipe                      - Wipe card data")
-        print("  webui <on|off>            - Enable/disable web interface and WiFi")
+        print("  totp <secret>             - Write TOTP 2FA secret")
+        print("  totp <secret>             - Write TOTP 2FA secret")
+        print("  webui <on|off>            - Enable/disable web interface (leaves WiFi on)")
+        print("  wifi <on|off>             - Enable/disable WiFi (disabling kills WebUI too)")
         print("")
         print("Macro Format (use {KEY:name}, {COMBO:mod+key}, {DELAY:ms}):")
         print("  Example: macro Hello{KEY:ENTER}{COMBO:CTRL+C}")
@@ -1376,6 +1613,15 @@ while True:
                         except Exception as e:
                             read_result["macro_parse_error"] = str(e)
                             
+                            read_result["macro_parse_error"] = str(e)
+                    
+                    elif c_type == TYPE_TOTP and c_data:
+                        read_result["type_name"] = "TOTP Authenticator"
+                        read_result["length"] = len(c_data)
+                        read_result["totp_secret"] = c_data
+                        # Preview code
+                        read_result["totp_preview"] = generate_totp(c_data)
+
                     elif c_type == TYPE_UNKNOWN:
                         read_result["type_name"] = "Unknown/Empty"
                         read_result["error"] = "No valid data found on card. (Card may be blank, corrupted, or use different encryption)"
@@ -1422,6 +1668,9 @@ while True:
                                     print(f"  {i}. COMBO: {cmd_value}")
                                 elif cmd_type == 'DELAY':
                                     print(f"  {i}. DELAY: {cmd_value}ms")
+                    if read_result.get("totp_secret"):
+                        print(f"TOTP Secret: {read_result['totp_secret']}")
+                        print(f"Current Code: {read_result['totp_preview']}")
                     if read_result.get("error"):
                         print(read_result["error"])
                     if read_result.get("warning"):
@@ -1475,9 +1724,21 @@ while True:
                             print("Falling back to plain text typing")
                             layout.write(c_data)
                         time.sleep(2.0)
-                    elif c_type == TYPE_MACRO:
                         print(f"Card {h_id}: Macro detected but data is empty or None")
                         print(f"c_data value: {repr(c_data)}")
+
+                    elif c_type == TYPE_TOTP and c_data:
+                        print(f"Card {h_id}: TOTP Secret found!")
+                        # Generate and Type
+                        code = generate_totp(c_data)
+                        if code != "000000":
+                            print(f"Type Code: {code}")
+                            layout.write(code)
+                            time.sleep(0.3)
+                            kbd.send(Keycode.ENTER)
+                        else:
+                            print("Error generating TOTP")
+                        time.sleep(2.0)
                     else:
                         # print(f"Card {h_id}: No valid password found")
                         time.sleep(0.5)

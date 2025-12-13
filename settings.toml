@@ -1,3 +1,4 @@
-SSID = "wifi-SSID"
-PASS = "password"
+SSID = ""
+PASS = ""
 WEBUI_ENABLED = 1
+WIFI_ENABLED = 1

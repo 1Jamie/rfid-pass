@@ -10,6 +10,7 @@ To enhance security, the system uses **Anti-Cloning UID Binding** and a **Custom
     *   **Password Only**: Classic mode. Types password + Enter.
     *   **Username + Password**: Types Username + Tab + Password + Enter.
     *   **Advanced Macros**: Rubber Ducky-style macros with key sequences, combinations, and delays.
+    *   **TOTP Authenticator**: Stores 2FA secrets and types the current 6-digit code (Time-based One-Time Password).
 *   **Web Management Interface**: Modern, browser-based UI for managing cards without serial console access. Features real-time status updates, formatted read results, and intuitive forms for writing credentials or macros.
 *   **Multi-Sector/Page Support**: Uses chained storage across multiple blocks/pages for large data:
     *   **Mifare 1K**: Up to ~660 bytes (44 data blocks × 15 bytes)
@@ -20,6 +21,7 @@ To enhance security, the system uses **Anti-Cloning UID Binding** and a **Custom
     *   `PfId`: Password Only
     *   `PfUs`: Username + Password
     *   `PfMc`: Advanced Macro
+    *   `Pf2F`: TOTP Authenticator
 *   **On-Card Storage**: Credentials and macros travel with the user, not the reader.
 *   **Universal Support (Custom Driver)**: I include a **custom implementation of the MFRC522 driver** (`lib/mfrc522.py`) specifically modified to support **NTAG 215** chips (and other 7-byte UID tags) alongside standard Mifare Classic 1KB cards.
 *   **Dual Interface**: Both serial console and web UI for maximum flexibility.
@@ -80,11 +82,15 @@ To enable the Web UI, configure your Wi-Fi credentials in `settings.toml`:
 ```toml
 SSID = "your-wifi-network-name"
 PASS = "your-wifi-password"
+WIFI_ENABLED = 1
 WEBUI_ENABLED = 1
 ```
 
+*   **WIFI_ENABLED**: Set to 1 to enable Wi-Fi connection (required for TOTP/NTP).
 *   **WEBUI_ENABLED**: Set to 1 to enable the Web UI.
-*   **Effect**: The Web UI will be available at `http://<device-ip>/`.
+*   **Effect**:
+    *   If `WIFI_ENABLED=1` and `WEBUI_ENABLED=0`: Device connects to Wi-Fi for time sync, but Web UI is disabled (Secure 2FA Mode).
+    *   If `WEBUI_ENABLED=1`: Device connects to Wi-Fi and starts the Web UI at `http://<device-ip>/`.
 If you dont want to use wifi or your device does not support it set WEBUI_ENABLED to 0.
 
 The device will automatically connect to Wi-Fi on boot and display its IP address in the serial console. The Web UI will be available at `http://<device-ip>/`.
@@ -100,6 +106,7 @@ Just tap a programmed card.
     *   **Password Only**: Types `password` -> `Enter`.
     *   **Username + Password**: Types `username` -> `Tab` -> `password` -> `Enter`.
     *   **Macro**: Parses and executes the macro sequence (key presses, combinations, delays, etc.).
+    *   **TOTP**: Calculates current 2FA code (HMAC-SHA1) and types it.
 
 ### Web Management Interface
 
@@ -119,6 +126,7 @@ The Web UI provides an intuitive interface for all card management operations:
     *   **Password Only**: Write a simple password card
     *   **Username + Password**: Write username and password combination
     *   **Advanced Macro**: Write Rubber Ducky-style macros with full syntax support
+    *   **TOTP Authenticator**: Write Base32 2FA secrets (e.g., from Google Authenticator)
 *   **Read Cards**: Inspect card contents without executing them
     *   Displays card type, UID, and formatted data
     *   For macros, shows parsed command breakdown
@@ -187,15 +195,15 @@ Connect to the Pico's serial console to manage cards.
 *   `wipe`:
     *   Wipes all data from the card (detects and clears chained data automatically).
 *   `webui <on/off>`:
-    *   Enable or disable the Web UI and wifi.
+    *   Enable or disable the Web UI.
+    *   **Note**: `webui off` disables the server but **leaves Wi-Fi connected** to maintain time sync for TOTP.
+*   `wifi <on/off>`:
+    *   Enable or disable Wi-Fi.
+    *   **Note**: `wifi off` disconnects Wi-Fi AND stops the Web UI (since it requires network).
     *   **Example Usage:**
         ```
-        > webui on
-        Web UI enabled.
-        ```
-        ```
-        > webui off
-        Web UI disabled.
+        > wifi on
+        WiFi connected successfully.
         ```
 
 #### Advanced Macro Commands
@@ -204,6 +212,11 @@ Connect to the Pico's serial console to manage cards.
     *   Writes an **Advanced Macro** tag (Header: `PfMc`).
     *   Automatically uses chained storage mode for any size data.
     *   Supports Rubber Ducky-style syntax with key sequences, combinations, and delays.
+
+*   `totp <base32_secret>`:
+    *   Writes a **TOTP Authenticator** tag (Header: `Pf2F`).
+    *   Stores the secret (Base32) and generates codes on scan.
+    *   **Note**: Requires Wi-Fi to sync time via NTP.
 
 ### Reading Card Contents
 
@@ -379,3 +392,30 @@ The macro executes immediately when the card is scanned, so be careful with macr
 *   **Escape Sequences**: For special characters, use key combinations or explicit strings.
 *   **Length Limits**: Remember storage limits (660 bytes for Mifare, 393 bytes for NTAG215).
 *   **Backward Compatibility**: Legacy password/username cards continue to work alongside macro cards.
+
+## Hardware 2FA (TOTP)
+
+The device can act as a physical 2FA token (like a programmable hardware token).
+
+1.  **Get Secret**: When setting up 2FA on a website, look for the "enter key manually" option to get the Base32 secret (e.g., `JBSWY3DPEHPK3PXP`).
+2.  **Write Card**:
+    *   **Web UI**: Select "TOTP Authenticator", paste the secret, and click Burn.
+    *   **Serial**: Run `totp JBSWY3DPEHPK3PXP`.
+3.  **Usage**: When prompted for a 2FA code, scan the card. The device will calculate the current code and type it.
+
+
+### Prerequisites
+*   **Wi-Fi Connection**: The Pico **MUST** be connected to Wi-Fi to synchronize its internal clock via NTP. Without accurate time, generated codes will be rejected by the service.
+*   **Configuration**: Ensure `settings.toml` has valid `SSID` and `PASS`. Set `WIFI_ENABLED = 1`. `WEBUI_ENABLED` can be 0 if you want 2FA without the management interface.
+
+### Troubleshooting
+*   **Code Rejected?**:
+    *   Check if the Pico has synced time (look for "TOTP: Time synced!" in serial output on boot).
+    *   Wait for the next 30-second window and try again.
+*   **"Time Sync Failed"**: Check your Wi-Fi credentials in `settings.toml`.
+*   **Generic Error**: Ensure the secret was valid Base32 (A-Z, 2-7).
+
+### Security
+The TOTP secret is stored **encrypted** on the card using the same UID-binding mechanism as passwords. Use the `MASTER_SECRET` in `code.py` to ensure only your reader can generate codes from your cards.
+
+
