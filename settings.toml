@@ -1,0 +1,3 @@
+SSID = "wifi-SSID"
+PASS = "password"
+WEBUI_ENABLED = 1

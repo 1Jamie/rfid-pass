@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RFID Pass</title>
+<style>
+body{font-family:sans-serif;margin:20px;background:#f5f5f5}
+.card{background:#fff;padding:15px;margin:10px 0;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+h1{text-align:center;margin:0 0 20px;color:#333}
+h2{margin:0 0 15px;font-size:1.2em;color:#555}
+input,select,textarea,button{width:100%;padding:8px;margin:5px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-size:14px}
+button{background:#6366f1;color:#fff;border:none;cursor:pointer;font-weight:600;margin-top:10px}
+button:hover{background:#4f46e5}
+.btn-success{background:#10b981}
+.btn-success:hover{background:#059669}
+.btn-danger{background:#ef4444}
+.btn-danger:hover{background:#dc2626}
+.status{padding:10px;margin:10px 0;border-radius:4px;background:#e0e7ff;text-align:center}
+pre{background:#f8f9fa;padding:10px;border-radius:4px;overflow:auto;font-size:12px;max-height:400px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<h1>RFID Pass Control</h1>
+<div class="card">
+<h2>Write Card</h2>
+<form id="writeForm" onsubmit="handleWrite(event)">
+<select name="type" id="writeType" onchange="toggleFields()">
+<option value="pass">Password Only</option>
+<option value="user">Username + Password</option>
+<option value="macro">Macro</option>
+</select>
+<div id="fieldUsername" class="hidden">
+<input type="text" name="username" id="writeUsername" placeholder="Username">
+</div>
+<div id="fieldPassword">
+<input type="password" name="password" id="writePassword" placeholder="Password" required>
+</div>
+<div id="fieldMacro" class="hidden">
+<textarea name="macro_text" id="writeMacro" rows="4" placeholder="Macro: {KEY:ENTER}, {COMBO:CTRL+C}"></textarea>
+</div>
+<button type="submit">Burn to Card</button>
+</form>
+</div>
+<div class="card">
+<h2>Actions</h2>
+<button onclick="handleAction('/read')" class="btn-success">Read Card</button>
+<button onclick="handleAction('/wipe')" class="btn-danger">Wipe Card</button>
+</div>
+<div class="card">
+<h2>Status</h2>
+<div id="status" class="status">Ready</div>
+<div id="readResult" class="hidden"><pre id="readResultPre"></pre></div>
+</div>
+<script>
+function toggleFields(){
+var type=document.getElementById('writeType').value;
+var u=document.getElementById('fieldUsername');
+var p=document.getElementById('fieldPassword');
+var m=document.getElementById('fieldMacro');
+if(type==='macro'){
+u.classList.add('hidden');
+p.classList.add('hidden');
+m.classList.remove('hidden');
+document.getElementById('writePassword').removeAttribute('required');
+}else if(type==='user'){
+u.classList.remove('hidden');
+p.classList.remove('hidden');
+m.classList.add('hidden');
+document.getElementById('writePassword').setAttribute('required','required');
+}else{
+u.classList.add('hidden');
+p.classList.remove('hidden');
+m.classList.add('hidden');
+document.getElementById('writePassword').setAttribute('required','required');
+}
+}
+async function handleWrite(e){
+e.preventDefault();
+var formData=new URLSearchParams();
+var type=document.getElementById('writeType').value;
+formData.append('type',type);
+if(type==='macro'){
+var macroText=document.getElementById('writeMacro').value;
+formData.append('macro_text',macroText);
+}else{
+var password=document.getElementById('writePassword').value;
+formData.append('password',password);
+if(type==='user'){
+var username=document.getElementById('writeUsername').value;
+formData.append('username',username);
+}
+}
+try{
+lastStatus='Sending...';
+document.getElementById('status').textContent='Sending...';
+var response=await fetch('/write',{method:'POST',body:formData});
+var text=await response.text();
+lastStatus=text;
+document.getElementById('status').textContent=text;
+}catch(err){
+lastStatus='Error: '+err;
+document.getElementById('status').textContent='Error: '+err;
+}
+}
+async function handleAction(endpoint){
+try{
+if(endpoint==='/read'){
+document.getElementById('readResult').classList.add('hidden');
+}
+lastStatus='Sending...';
+document.getElementById('status').textContent='Sending...';
+var response=await fetch(endpoint,{method:'POST'});
+var text=await response.text();
+lastStatus=text;
+document.getElementById('status').textContent=text;
+}catch(err){
+lastStatus='Error: '+err;
+document.getElementById('status').textContent='Error: '+err;
+}
+}
+var lastStatus='';
+var statusResetTimeout=null;
+async function updateStatus(){
+try{
+var response=await fetch('/status');
+var data=await response.json();
+if(data.status&&data.status!==lastStatus){
+lastStatus=data.status;
+document.getElementById('status').textContent=data.status;
+if(statusResetTimeout){
+clearTimeout(statusResetTimeout);
+statusResetTimeout=null;
+}
+if(data.status.includes('Success')||data.status.includes('Complete')||data.status.includes('Wiped')){
+statusResetTimeout=setTimeout(function(){
+if(lastStatus===data.status){
+lastStatus='Device Ready';
+document.getElementById('status').textContent='Device Ready';
+}
+},3000);
+}
+}
+if(data.read_result){
+document.getElementById('readResult').classList.remove('hidden');
+document.getElementById('readResultPre').textContent=JSON.stringify(data.read_result,null,2);
+}
+}catch(e){}
+}
+setInterval(updateStatus,1000);
+</script>
+</body>
+</html>
